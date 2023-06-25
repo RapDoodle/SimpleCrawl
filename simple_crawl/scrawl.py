@@ -16,6 +16,7 @@ from pymongo import MongoClient, UpdateOne
 from urllib.parse import quote, unquote, urljoin
 
 from .task import Task
+from .store import MongoDBStore
 
 def _main():
     parser = argparse.ArgumentParser(description='Crawl from the web.')
@@ -71,9 +72,7 @@ def _main():
     if args.mongodb_url is None and os.getenv('MONGODB_URL') is None:
         print('Variable MONGODB_URL is not specified as environment variable or command line arguments.')
         exit(1)
-    mongodb_client = MongoClient(args.mongodb_url)
-    mongodb_database = mongodb_client['scrawl']
-    webpages_collection = mongodb_database['webpages']
+    store = MongoDBStore(args.mongodb_url)
 
     task_config = task.progress['config']
     crawler_opt = task_config.get('crawlerOptions', {})
@@ -98,16 +97,14 @@ def _main():
     )
 
     # Crawl with BFS
-    webpages_write_buffer = []
     queue = task.progress['queue']
     visited = task.progress['visited']
     failed = task.progress['failed']
     inserted = task.progress['inserted']
 
-    def flush_webpages():
-        if len(webpages_write_buffer) > 0:
-            webpages_collection.bulk_write(webpages_write_buffer)
-            webpages_write_buffer.clear()
+    def flush():
+        store.commit()
+        task.save_progress()
 
     def bfs_crawl():
         completed = itertools.count(len(visited))
@@ -126,8 +123,8 @@ def _main():
             
             content = response.content.decode()
             parsed_html = BeautifulSoup(content, 'html.parser')
-            webpages_write_buffer.append(UpdateOne(
-                {'_id': url}, 
+            store.update(
+                {'_id': url},
                 {'$set': {
                     'url': unquote(url),
                     'statusCode': response.status_code,
@@ -136,7 +133,8 @@ def _main():
                     'content': content,
                     'fetchedAt': datetime.datetime.utcnow(),
                     'taskId': task.id
-                }}, upsert=True)
+                }},
+                upsert=True
             )
             if parsed_html.title is None:
                 pbar.write(f'{url} does not have a title.')
@@ -171,8 +169,7 @@ def _main():
                     future_list.append(executor.submit(fetch, url))
                     curr_count = curr_count - 1
                 concurrent.futures.wait(future_list, timeout=60)
-                flush_webpages()
-                task.save_progress()
+                flush()
         pbar.close()
     
     bfs_crawl()
@@ -184,8 +181,7 @@ def _main():
             failed.clear()
             bfs_crawl()
             max_retry_from_failed = max_retry_from_failed - 1
-    flush_webpages()
-    task.save_progress()
+    flush()
 
 if __name__ == '__main__':
     _main()
